@@ -1,18 +1,20 @@
 ﻿using System.Collections.Generic;
 using UnityEngine;
 
-// Gắn script này lên GameObject có BoxCollider (Is Trigger = true) phủ mặt vợt của BẠN.
+// Gắn script này lên GameObject có Collider phủ mặt vợt của BẠN (khuyến nghị Is Trigger = true).
 // Khi Shuttlecock (tag) đi vào trigger, script sẽ:
-// - Lấy hướng bắn theo shuttleSpawn.forward (trục Z cục bộ của Racket bạn).
-// - Tính tốc độ ra theo COR đơn giản hoặc theo baseExitSpeed.
-// - Chọn 1: Thay đổi trực tiếp vận tốc trái cầu hiện tại.
-// - Chọn 2: Hủy trái cầu cũ, sinh trái cầu mới ở shuttleSpawn (prefab), đặt vận tốc mới.
-//   (dùng respawnNewShuttle = true nếu muốn "hủy & sinh mới").
+// - Tùy chọn kích hoạt Slow-Motion trong thời gian shuttle NẰM TRONG vùng hit (WhileInsideOnly).
+// - Trả cầu theo logic hiện có (COR / baseExitSpeed / curve). An toàn, không phá vỡ hành vi cũ.
 //
-// Lưu ý:
-// - Theo mô tả trục của bạn: forward (Z) là hướng bắn, "up" = trục X. Script set rotation = LookRotation(dir, shuttleSpawn.right).
-// - Collider nên là trigger để tránh lực đẩy vật lý không mong muốn.
-// - Sử dụng rb.linearVelocity cho đồng bộ với SimpleShuttlecockPhysics của bạn.
+// Slow-Motion tích hợp (Phase 1+):
+// - Nếu triggerSlowMoOnHit = true và có TimeDilationManager + profile, khi shuttle ENTER -> BeginWindow(...)
+// - Nếu slowMoWhileInsideOnly = true: Khi shuttle EXIT -> CancelWindow(token) để thoát slow-mo ngay.
+//   + Điều này đảm bảo slow-mo chỉ tồn tại trong vùng hit, đúng yêu cầu của bạn.
+// - Nếu respawnNewShuttle hủy shuttle ngay trong vùng, chúng ta chủ động CancelWindow trước khi Destroy để không bị "kẹt slow-mo".
+//
+// Quy ước trục (giữ nguyên theo repo):
+// - Hướng bắn = shuttleSpawn.forward (trục Z).
+// - Up cho LookRotation = shuttleSpawn.right (trục X).
 
 [RequireComponent(typeof(Collider))]
 public class RacketHitZone : MonoBehaviour
@@ -40,11 +42,24 @@ public class RacketHitZone : MonoBehaviour
     public float rehitCooldown = 0.12f; // chống trigger nhiều lần trên 1 lần chạm
     public bool zeroAngularOnExit = true;
 
+    [Header("Slow-Mo (optional)")]
+    [Tooltip("If true, trigger slow-motion when a valid shuttle enters this zone.")]
+    public bool triggerSlowMoOnHit = true;
+
+    [Tooltip("Profile used for the slow-motion window when shuttle enters this zone.")]
+    public TimeDilationSettings slowMoProfile;
+
+    [Tooltip("If true, slow-motion will be kept ONLY while the shuttle stays inside this trigger. It cancels on exit.")]
+    public bool slowMoWhileInsideOnly = true;
+
     [Header("Debug")]
     public bool logOnHit = true;
 
     private Collider zone;
     private readonly Dictionary<int, float> lastHitTime = new Dictionary<int, float>();
+
+    // Map each shuttle instance -> active slow-mo token (for WhileInside cancellation)
+    private readonly Dictionary<int, int> activeSlowMoTokens = new Dictionary<int, int>();
 
     void Reset()
     {
@@ -69,24 +84,77 @@ public class RacketHitZone : MonoBehaviour
 
     void OnTriggerEnter(Collider other)
     {
+        // Start slow-mo if needed, then handle return logic
+        MaybeBeginSlowMo(other);
         TryHandle(other);
+    }
+
+    void OnTriggerExit(Collider other)
+    {
+        MaybeCancelSlowMo(other);
     }
 
     void OnCollisionEnter(Collision collision)
     {
-        // Cho trường hợp bạn muốn dùng collider non-trigger (ít khuyên dùng)
+        // Trong trường hợp dùng collider non-trigger (ít khuyến nghị), cố gắng mô phỏng hành vi tương tự
+        MaybeBeginSlowMo(collision.collider);
         TryHandle(collision.collider);
+    }
+
+    void OnCollisionExit(Collision collision)
+    {
+        MaybeCancelSlowMo(collision.collider);
+    }
+
+    void MaybeBeginSlowMo(Collider other)
+    {
+        if (!triggerSlowMoOnHit || slowMoProfile == null) return;
+        if (TimeDilationManager.Instance == null) return;
+        if (!IsValidShuttle(other, out var rb)) return;
+
+        int id = rb.GetInstanceID();
+        // Nếu đã có token (đang ở trong vùng), không mở lại
+        if (activeSlowMoTokens.ContainsKey(id)) return;
+
+        // Bắt đầu window. Nếu WhileInsideOnly, chúng ta vẫn dùng holdSeconds như dự phòng (fallback),
+        // nhưng sẽ chủ động cancel ngay khi EXIT.
+        int token = TimeDilationManager.Instance.BeginWindow(slowMoProfile, reason: "HitZone:WhileInside");
+        if (token > 0)
+        {
+            activeSlowMoTokens[id] = token;
+        }
+    }
+
+    void MaybeCancelSlowMo(Collider other)
+    {
+        if (TimeDilationManager.Instance == null) return;
+        if (!IsValidShuttle(other, out var rb)) return;
+
+        int id = rb.GetInstanceID();
+        if (activeSlowMoTokens.TryGetValue(id, out int token))
+        {
+            if (slowMoWhileInsideOnly)
+            {
+                TimeDilationManager.Instance.CancelWindow(token);
+            }
+            activeSlowMoTokens.Remove(id);
+        }
+    }
+
+    bool IsValidShuttle(Collider other, out Rigidbody rb)
+    {
+        rb = null;
+        if (!other || !other.gameObject.activeInHierarchy) return false;
+        if (!string.IsNullOrEmpty(shuttlecockTag) && !other.CompareTag(shuttlecockTag)) return false;
+        rb = other.attachedRigidbody;
+        return rb != null;
     }
 
     void TryHandle(Collider other)
     {
-        if (!other || !other.gameObject.activeInHierarchy) return;
-        if (!string.IsNullOrEmpty(shuttlecockTag) && !other.CompareTag(shuttlecockTag)) return;
+        if (!IsValidShuttle(other, out var rb)) return;
 
-        var rb = other.attachedRigidbody;
-        if (rb == null) return;
-
-        // Cooldown theo instanceID để tránh lặp
+        // Cooldown theo instanceID để tránh lặp quá nhanh
         int id = rb.GetInstanceID();
         float now = Time.time;
         if (lastHitTime.TryGetValue(id, out float last) && now - last < rehitCooldown) return;
@@ -98,7 +166,11 @@ public class RacketHitZone : MonoBehaviour
         Vector3 up = basis.right.normalized; // Up theo yêu cầu là trục X
 
         // Tính speed vào
+#if UNITY_6000_0_OR_NEWER
         float inSpeed = rb.linearVelocity.magnitude;
+#else
+        float inSpeed = rb.velocity.magnitude;
+#endif
 
         // Tính speed ra
         float outSpeed = baseExitSpeed;
@@ -113,21 +185,32 @@ public class RacketHitZone : MonoBehaviour
 
         if (respawnNewShuttle)
         {
+            // Nếu WhileInsideOnly: hủy slow-mo của shuttle này trước khi Destroy để tránh kẹt
+            if (activeSlowMoTokens.TryGetValue(id, out int token))
+            {
+                if (slowMoWhileInsideOnly && TimeDilationManager.Instance != null)
+                {
+                    TimeDilationManager.Instance.CancelWindow(token);
+                }
+                activeSlowMoTokens.Remove(id);
+            }
+
             // Hủy & sinh mới
             Vector3 origin = basis.position + dir * spawnOffset;
             Quaternion rot = Quaternion.LookRotation(dir, up);
 
-            // Hủy cũ
             var oldGo = rb.gameObject;
-            // Nếu dùng pooling sau này, hãy thay bằng trả pool
             Destroy(oldGo);
 
-            // Tạo mới
             GameObject go = Instantiate(shuttlecockPrefab, origin, rot);
             var newRb = go.GetComponent<Rigidbody>();
             if (newRb != null)
             {
+#if UNITY_6000_0_OR_NEWER
                 newRb.linearVelocity = dir * outSpeed;
+#else
+                newRb.velocity = dir * outSpeed;
+#endif
                 if (zeroAngularOnExit) newRb.angularVelocity = Vector3.zero;
             }
 
@@ -143,10 +226,18 @@ public class RacketHitZone : MonoBehaviour
             if (teleportIncomingToSpawn)
             {
                 Vector3 origin = basis.position + dir * spawnOffset;
+#if UNITY_6000_0_OR_NEWER
                 rb.position = origin;
+#else
+                rb.position = origin;
+#endif
             }
 
+#if UNITY_6000_0_OR_NEWER
             rb.linearVelocity = dir * outSpeed;
+#else
+            rb.velocity = dir * outSpeed;
+#endif
             if (zeroAngularOnExit) rb.angularVelocity = Vector3.zero;
 
             // Căn lại orientation của shuttle (tùy chọn, chỉ để nhìn cho đúng)
